@@ -194,16 +194,10 @@ export const getComponents = async ({
 
         const componentWithPackage = { ...component, isPackage };
 
-        // The ref keeps the story file's own import, which the import lines need. The engines read
-        // the export that declares the component instead when the import names it only through a
-        // member (`UI.Button` after `export * as UI`, where `UI` can also be another export's name),
-        // names another export, or does not resolve with React's resolver (tsconfig `${configDir}`
-        // or `references`, which core's resolver reads).
+        // Core's resolver decides which file and export the engines document, as in every other
+        // renderer. The ref keeps the story file's own import, which the import lines need.
         const target = docgenTargets?.get(c);
-        const useTarget =
-          !!target &&
-          (component.member !== undefined || target.exportName !== component.importName || !path);
-        const docgenRef = useTarget
+        const docgenRef = target
           ? {
               ...componentWithPackage,
               importName: target.exportName,
@@ -212,7 +206,7 @@ export const getComponents = async ({
               namespace: undefined,
             }
           : componentWithPackage;
-        const docgenPath = useTarget ? target.path : path;
+        const docgenPath = target?.path ?? path;
         path ??= docgenPath;
 
         if (path && docgenPath) {
