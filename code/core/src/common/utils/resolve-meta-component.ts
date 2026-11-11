@@ -9,7 +9,7 @@ import {
   oneLineTextOf,
 } from '../../csf-tools/story-shape/resolve-members.ts';
 import { jsTsSourceExtensions } from '../../shared/constants/extensions.ts';
-import { createModuleResolver } from './module-resolver.ts';
+import { type ModuleResolver, createModuleResolver } from './module-resolver.ts';
 
 /** The component a story file documents, as far as static analysis can determine. */
 export interface ResolvedMetaComponent {
@@ -32,10 +32,20 @@ export type MetaComponentResolution =
       expression: string;
     };
 
-export interface MetaComponentResolverOptions {
-  /** Extensions tried ahead of the JS/TS set, for single-file-component formats like `.vue`. */
-  extensions?: string[];
-}
+export type MetaComponentResolverOptions =
+  | {
+      /** Extensions tried ahead of the JS/TS set, for single-file-component formats like `.vue`. */
+      extensions?: string[];
+      resolver?: never;
+    }
+  | {
+      /**
+       * Resolves import specifiers in place of the default resolver, for a renderer whose packages
+       * need their own conditions or extension aliases.
+       */
+      resolver: ModuleResolver;
+      extensions?: never;
+    };
 
 /** Peels the type-level wrappers off a component expression, as in `Comp<Props>` or `Comp as any`. */
 const unwrapComponentExpression = (node: Node): Node => {
@@ -56,24 +66,25 @@ const unwrapComponentExpression = (node: Node): Node => {
  * component annotation.
  */
 export function createMetaComponentResolver(options: MetaComponentResolverOptions = {}) {
-  const resolver = createModuleResolver({
-    extensions: [...(options.extensions ?? []), ...jsTsSourceExtensions],
-    mainFields: ['module', 'main'],
-    tsconfig: 'auto',
-  });
+  const resolver =
+    options.resolver ??
+    createModuleResolver({
+      extensions: [...(options.extensions ?? []), ...jsTsSourceExtensions],
+      // TypeScript's ESM resolution imports `./ui.ts` as `./ui.js`.
+      extensionAlias: {
+        '.js': ['.ts', '.tsx', '.js'],
+        '.jsx': ['.tsx', '.jsx'],
+        '.mjs': ['.mts', '.mjs'],
+        '.cjs': ['.cts', '.cjs'],
+      },
+      mainFields: ['module', 'main'],
+      tsconfig: 'auto',
+    });
 
-  const resolveFile = (fromFile: string, specifier: string): string | undefined => {
-    try {
-      return resolver.resolveFileSync(fromFile, specifier);
-    } catch {
-      return undefined;
-    }
-  };
-
-  const resolveModule = (fromFile: string, specifier: string): ReferenceModule | undefined => {
-    const filePath = resolveFile(fromFile, specifier);
-    return filePath ? parseReferenceModule(filePath) : undefined;
-  };
+  const resolveFile = (fromFile: string, specifier: string) =>
+    resolveFileOrUndefined(resolver, fromFile, specifier);
+  const resolveModule = (fromFile: string, specifier: string) =>
+    resolveReferenceModule(resolver, fromFile, specifier);
 
   const fromIdentifier = (module: ReferenceModule, localName: string): MetaComponentResolution => {
     const binding = findImport(module.editor.program, localName);
@@ -112,25 +123,18 @@ export function createMetaComponentResolver(options: MetaComponentResolverOption
       return fromIdentifier(storyModule, expression.name);
     }
 
-    // `ns.Button`, where `ns` is a namespace import, is `import { Button } from …` written another
-    // way, so it resolves the same.
+    // `ns.Button`, where `ns` is a namespace, is `import { Button } from …` written another way, so it
+    // resolves the same. The namespace can also come from a barrel, as in `export * as ns from …`.
     if (
       expression.type === 'MemberExpression' &&
       !expression.computed &&
       expression.object.type === 'Identifier' &&
       expression.property.type === 'Identifier'
     ) {
-      const namespace = findImport(csf.program, expression.object.name);
-      if (namespace.kind === 'namespace') {
+      const namespace = namespaceBinding(resolver, storyModule, expression.object.name, new Set());
+      if (namespace) {
         const exportName = expression.property.name;
-        return {
-          component: {
-            localName: exportName,
-            importId: namespace.importId,
-            exportName,
-            path: resolveFile(storyPath, namespace.importId),
-          },
-        };
+        return { component: { localName: exportName, exportName, ...namespace } };
       }
     }
 
@@ -153,6 +157,135 @@ export function createMetaComponentResolver(options: MetaComponentResolverOption
 
     return { reason: 'unreadable-component-expression', expression: oneLineTextOf(node) };
   };
+}
+
+/** The module a namespace stands for: its specifier, and the file that specifier resolves to. */
+export type NamespaceModule = Required<Pick<ResolvedMetaComponent, 'importId'>> &
+  Pick<ResolvedMetaComponent, 'path'>;
+
+/**
+ * The module that a named import stands for when the export it reads is a namespace, as `UI` is
+ * after `export * as UI from './ui'`. Follows the export through re-exports, as a barrel writes
+ * them; `undefined` when the export is not a namespace or cannot be followed.
+ */
+export function resolveImportedNamespace(
+  resolver: ModuleResolver,
+  fromFile: string,
+  importId: string,
+  exportName: string
+): NamespaceModule | undefined {
+  const module = resolveReferenceModule(resolver, fromFile, importId);
+  return module && namespaceExport(resolver, module, exportName, new Set());
+}
+
+function namespaceExport(
+  resolver: ModuleResolver,
+  module: ReferenceModule,
+  exportName: string,
+  seen: Set<string>
+): NamespaceModule | undefined {
+  // Two barrels can re-export each other with `export *`, which would never end.
+  const key = `${module.filePath}#${exportName}`;
+  if (seen.has(key)) {
+    return undefined;
+  }
+  seen.add(key);
+
+  const forward = (specifier: string, name: string) => {
+    const target = resolveReferenceModule(resolver, module.filePath, specifier);
+    return target && namespaceExport(resolver, target, name, seen);
+  };
+
+  // An explicit export wins over `export *` wherever it is written, so the stars are tried last.
+  const stars: string[] = [];
+  for (const statement of module.editor.program.body) {
+    if (statement.type === 'ExportAllDeclaration' && statement.exportKind !== 'type') {
+      const specifier = statement.source.value;
+      if (!statement.exported) {
+        stars.push(specifier);
+      } else if (moduleExportName(statement.exported) === exportName) {
+        return {
+          importId: specifier,
+          path: resolveFileOrUndefined(resolver, module.filePath, specifier),
+        };
+      }
+      continue;
+    }
+
+    if (statement.type !== 'ExportNamedDeclaration' || statement.exportKind === 'type') {
+      continue;
+    }
+    // `export const UI = …` is a value, not a namespace, and it still shadows any `export *`.
+    if (statement.declaration && declares(module, statement.declaration, exportName)) {
+      return undefined;
+    }
+    const specifier = statement.specifiers.find(
+      (candidate) =>
+        candidate.exportKind !== 'type' && moduleExportName(candidate.exported) === exportName
+    );
+    if (!specifier) {
+      continue;
+    }
+    const localName = moduleExportName(specifier.local);
+    // `import * as UI from './ui'; export { UI }` is `export * as UI from './ui'` in two steps.
+    return statement.source
+      ? forward(statement.source.value, localName)
+      : namespaceBinding(resolver, module, localName, seen);
+  }
+
+  // `export *` forwards every name but `default`.
+  if (exportName === 'default') {
+    return undefined;
+  }
+  for (const specifier of stars) {
+    const found = forward(specifier, exportName);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+// The module a name stands for as a namespace, in the module that binds the name.
+function namespaceBinding(
+  resolver: ModuleResolver,
+  module: ReferenceModule,
+  localName: string,
+  seen: Set<string>
+): NamespaceModule | undefined {
+  const binding = findImport(module.editor.program, localName);
+  if (binding.kind === 'namespace') {
+    return {
+      importId: binding.importId,
+      path: resolveFileOrUndefined(resolver, module.filePath, binding.importId),
+    };
+  }
+  if (binding.kind !== 'import') {
+    return undefined;
+  }
+  const target = resolveReferenceModule(resolver, module.filePath, binding.importId);
+  return target && namespaceExport(resolver, target, binding.exportName, seen);
+}
+
+function resolveFileOrUndefined(
+  resolver: ModuleResolver,
+  fromFile: string,
+  specifier: string
+): string | undefined {
+  try {
+    return resolver.resolveFileSync(fromFile, specifier);
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveReferenceModule(
+  resolver: ModuleResolver,
+  fromFile: string,
+  specifier: string
+): ReferenceModule | undefined {
+  const filePath = resolveFileOrUndefined(resolver, fromFile, specifier);
+  return filePath ? parseReferenceModule(filePath) : undefined;
 }
 
 type ImportBinding =
@@ -191,13 +324,29 @@ function findImport(program: E.Program, localName: string): ImportBinding {
       return {
         kind: 'import',
         importId,
-        exportName:
-          specifier.imported.type === 'Identifier'
-            ? specifier.imported.name
-            : (specifier.imported as E.StringLiteral).value,
+        exportName: moduleExportName(specifier.imported),
       };
     }
   }
 
   return { kind: 'local' };
+}
+
+function declares(module: ReferenceModule, declaration: Node, name: string): boolean {
+  if (declaration.type === 'VariableDeclaration') {
+    // A destructuring pattern can bind the name anywhere inside it, so the scope says where.
+    const identifier = module.editor.scopes.program.bindings.get(name)?.identifier;
+    return (
+      !!identifier && identifier.start >= declaration.start && identifier.end <= declaration.end
+    );
+  }
+  // Functions, classes, enums and TS namespaces name themselves in `id`.
+  return (
+    'id' in declaration && declaration.id?.type === 'Identifier' && declaration.id.name === name
+  );
+}
+
+// A specifier can write the name as a string, as in `export { a as 'b' }`.
+function moduleExportName(node: E.ModuleExportName): string {
+  return node.type === 'Identifier' ? node.name : (node as E.StringLiteral).value;
 }
